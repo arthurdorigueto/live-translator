@@ -10,11 +10,12 @@ import wave
 
 import numpy as np
 import sounddevice as sd
+from dotenv import load_dotenv
 from openai import OpenAI
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-DEFAULT_CHUNK_SECONDS = 3
+DEFAULT_CHUNK_SECONDS = 30
 DEFAULT_SILENCE_THRESHOLD = 0.005  # RMS below this is silence
 
 
@@ -47,50 +48,78 @@ def _translate(client: OpenAI, audio: np.ndarray) -> str | None:
     wav = io.BytesIO(_to_wav_bytes(audio))
     wav.name = "audio.wav"
     try:
-        result = client.audio.translations.create(
+        transcription = client.audio.transcriptions.create(
             model="whisper-1",
             file=wav,
             response_format="text",
         )
-        text = result.strip() if isinstance(result, str) else str(result).strip()
-        return text or None
+        source_text = (
+            transcription.strip()
+            if isinstance(transcription, str)
+            else str(transcription).strip()
+        )
+        if not source_text:
+            return None
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a translator. Translate the user's text to Brazilian Portuguese (pt-BR). "
+                        "Output only the translated text, nothing else. "
+                        "If the text is already in Brazilian Portuguese, output it as-is."
+                    ),
+                },
+                {"role": "user", "content": source_text},
+            ],
+            temperature=0,
+        )
+        return response.choices[0].message.content.strip() or None
     except Exception as exc:
-        print(f"\n[whisper error] {exc}", file=sys.stderr)
+        print(f"\n[error] {exc}", file=sys.stderr)
         return None
 
 
 def main() -> None:
+    load_dotenv()
     parser = argparse.ArgumentParser(
         description="Record audio and translate it to English in real time."
     )
     parser.add_argument(
-        "--list-devices", "-l",
+        "--list-devices",
+        "-l",
         action="store_true",
         help="List available input devices and exit",
     )
     parser.add_argument(
-        "--device", "-d",
+        "--device",
+        "-d",
         type=int,
         default=None,
         metavar="INDEX",
         help="Input device index (default: system default)",
     )
     parser.add_argument(
-        "--device-name", "-n",
+        "--device-name",
+        "-n",
         type=str,
         default=None,
         metavar="NAME",
         help="Select input device by name substring (case-insensitive), e.g. 'blackhole'",
     )
     parser.add_argument(
-        "--chunk", "-c",
+        "--chunk",
+        "-c",
         type=float,
         default=DEFAULT_CHUNK_SECONDS,
         metavar="SECONDS",
         help=f"Audio chunk length in seconds (default: {DEFAULT_CHUNK_SECONDS})",
     )
     parser.add_argument(
-        "--silence-threshold", "-s",
+        "--silence-threshold",
+        "-s",
         type=float,
         default=DEFAULT_SILENCE_THRESHOLD,
         metavar="RMS",
@@ -105,15 +134,22 @@ def main() -> None:
     if args.device_name:
         name_lower = args.device_name.lower()
         matches = [
-            i for i, d in enumerate(sd.query_devices())
+            i
+            for i, d in enumerate(sd.query_devices())
             if d["max_input_channels"] > 0 and name_lower in d["name"].lower()
         ]
         if not matches:
-            print(f"[error] No input device matching '{args.device_name}'.", file=sys.stderr)
+            print(
+                f"[error] No input device matching '{args.device_name}'.",
+                file=sys.stderr,
+            )
             print("Run with --list-devices to see available devices.", file=sys.stderr)
             sys.exit(1)
         if len(matches) > 1:
-            print(f"[warning] Multiple devices match '{args.device_name}', using first:", file=sys.stderr)
+            print(
+                f"[warning] Multiple devices match '{args.device_name}', using first:",
+                file=sys.stderr,
+            )
             for i in matches:
                 print(f"  [{i}] {sd.query_devices(i)['name']}", file=sys.stderr)
         args.device = matches[0]
