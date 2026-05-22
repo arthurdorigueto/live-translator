@@ -1,11 +1,12 @@
-"""Live audio translator — records audio and outputs English text."""
+"""Live audio translator — records audio and outputs Brazilian Portuguese text."""
 
 import argparse
 import io
 import queue
 import sys
+import termios
 import threading
-import time
+import tty
 import wave
 
 import numpy as np
@@ -15,8 +16,6 @@ from openai import OpenAI
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-DEFAULT_CHUNK_SECONDS = 30
-DEFAULT_SILENCE_THRESHOLD = 0.005  # RMS below this is silence
 
 
 def list_devices() -> None:
@@ -38,10 +37,6 @@ def _to_wav_bytes(audio: np.ndarray) -> bytes:
         wf.writeframes((audio * 32767).astype(np.int16).tobytes())
     buf.seek(0)
     return buf.read()
-
-
-def _is_silent(audio: np.ndarray, threshold: float) -> bool:
-    return float(np.sqrt(np.mean(audio**2))) < threshold
 
 
 def _translate(client: OpenAI, audio: np.ndarray) -> str | None:
@@ -82,10 +77,20 @@ def _translate(client: OpenAI, audio: np.ndarray) -> str | None:
         return None
 
 
+def _read_key() -> str:
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(
-        description="Record audio and translate it to English in real time."
+        description="Record audio and translate it to Brazilian Portuguese in real time."
     )
     parser.add_argument(
         "--list-devices",
@@ -108,22 +113,6 @@ def main() -> None:
         default=None,
         metavar="NAME",
         help="Select input device by name substring (case-insensitive), e.g. 'blackhole'",
-    )
-    parser.add_argument(
-        "--chunk",
-        "-c",
-        type=float,
-        default=DEFAULT_CHUNK_SECONDS,
-        metavar="SECONDS",
-        help=f"Audio chunk length in seconds (default: {DEFAULT_CHUNK_SECONDS})",
-    )
-    parser.add_argument(
-        "--silence-threshold",
-        "-s",
-        type=float,
-        default=DEFAULT_SILENCE_THRESHOLD,
-        metavar="RMS",
-        help=f"Skip chunks quieter than this RMS level (default: {DEFAULT_SILENCE_THRESHOLD})",
     )
     args = parser.parse_args()
 
@@ -154,35 +143,31 @@ def main() -> None:
                 print(f"  [{i}] {sd.query_devices(i)['name']}", file=sys.stderr)
         args.device = matches[0]
 
-    client = OpenAI()  # reads OPENAI_API_KEY from env
+    client = OpenAI()
 
     raw_queue: queue.Queue[np.ndarray] = queue.Queue()
     translate_queue: queue.Queue[np.ndarray] = queue.Queue()
-    chunk_samples = int(args.chunk * SAMPLE_RATE)
+    cut_event = threading.Event()
 
-    # --- Thread 1: audio callback (runs in sounddevice's thread) ---
     def _audio_callback(indata, frames, time_info, status):
         if status:
             print(f"\n[audio] {status}", file=sys.stderr)
         raw_queue.put(indata[:, 0].copy())
 
-    # --- Thread 2: accumulate raw audio into fixed-size chunks ---
     def _record_loop():
         buf = np.zeros(0, dtype=np.float32)
         while True:
             try:
-                buf = np.concatenate([buf, raw_queue.get(timeout=0.5)])
+                buf = np.concatenate([buf, raw_queue.get(timeout=0.05)])
             except queue.Empty:
-                continue
+                pass
 
-            while len(buf) >= chunk_samples:
-                chunk, buf = buf[:chunk_samples], buf[chunk_samples:]
-                if _is_silent(chunk, args.silence_threshold):
-                    print("·", end="", flush=True)
-                else:
-                    translate_queue.put(chunk)
+            if cut_event.is_set():
+                cut_event.clear()
+                if len(buf) > 0:
+                    translate_queue.put(buf)
+                buf = np.zeros(0, dtype=np.float32)
 
-    # --- Thread 3: translate chunks and print ---
     def _translate_loop():
         while True:
             chunk = translate_queue.get()
@@ -192,8 +177,7 @@ def main() -> None:
 
     device_name = sd.query_devices(args.device or sd.default.device[0])["name"]
     print(f"Device : {device_name}")
-    print(f"Chunk  : {args.chunk}s | Silence threshold: {args.silence_threshold} RMS")
-    print("Listening... (Ctrl+C to stop)\n")
+    print("Press any key to send chunk. Ctrl+C to stop.\n")
 
     for target in (_record_loop, _translate_loop):
         threading.Thread(target=target, daemon=True).start()
@@ -207,8 +191,11 @@ def main() -> None:
             callback=_audio_callback,
             blocksize=1024,
         ):
+            print("Recording...", flush=True)
             while True:
-                time.sleep(0.1)
+                _read_key()
+                cut_event.set()
+                print()
     except KeyboardInterrupt:
         print("\n\nStopped.")
     except Exception as exc:
